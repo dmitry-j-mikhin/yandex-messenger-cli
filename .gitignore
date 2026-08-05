@@ -1,0 +1,5 @@
+# конфиг живёт в ~/.config/yandex-messenger/, но подстрахуемся: в репозитории его быть не должно
+config.json
+*.har
+__pycache__/
+*.pyc
