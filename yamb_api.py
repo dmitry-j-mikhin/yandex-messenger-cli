@@ -15,7 +15,7 @@ Read-методы идут на голой куке; registry-МУТАЦИИ т�
 (`ENTITY_NOT_FOUND` на чтении, `NO_SUCH_CHAT` на отправке), поэтому кандидат сверяется
 с `get_chats_info`.
 """
-import json, mimetypes, os, re, urllib.error, urllib.request, uuid
+import http.client, json, mimetypes, os, re, sys, time, urllib.error, urllib.parse, urllib.request, uuid
 
 import yamb_config
 from yamb_read import load_cookie_jar, my_guid
@@ -24,6 +24,7 @@ API_URL = "https://yandex.ru/messenger/api/registry/api/"
 CSRF_URL = "https://yandex.ru/messenger/api/registry/csrf-token/"
 # приватный хост вложений: file_shortterm требует той же сессии, что и API
 FILE_PRIVATE_HOST = "files.messenger.yandex.ru"
+UPLOAD_TRIES = 5   # попыток загрузки файла (каждая с новым upload_url)
 
 
 def _cookie_header():
@@ -235,16 +236,28 @@ def upload_file(chat_id, path, name=None, cookie=None):
         data = f.read()
     size = len(data)
 
-    # оба registry-шага загрузки — мутации: без X-CSRF-TOKEN сервер отдаёт 403 bad_csrf_token
-    d = call("upload_to_disk", {"files": [
-        {"name": name, "upload_id": str(uuid.uuid4()), "size": size, "chat_id": chat_id}
-    ]}, csrf=True, cookie=cookie)
-    upload_url = ((d.get("files") or [{}])[0]).get("upload_url")
-    if not upload_url:
-        raise RuntimeError(f"upload_to_disk без upload_url: {json.dumps(d, ensure_ascii=False)[:300]}")
-
     ctype = mimetypes.guess_type(name)[0] or "application/octet-stream"
-    location = _put_bytes(upload_url, data, ctype, cookie)
+    # Шаги 1-2 повторяем с новым upload_url: 12.10 сервер выдавал адрес на хосте, которого
+    # нет в DNS (uploader93klg.disk.yandex.net - NXDOMAIN), или рвал соединение посреди PUT.
+    # До add_files в чате ничего не появляется, так что повтор безопасен.
+    for attempt in range(1, UPLOAD_TRIES + 1):
+        # оба registry-шага загрузки — мутации: без X-CSRF-TOKEN сервер отдаёт 403 bad_csrf_token
+        d = call("upload_to_disk", {"files": [
+            {"name": name, "upload_id": str(uuid.uuid4()), "size": size, "chat_id": chat_id}
+        ]}, csrf=True, cookie=cookie)
+        upload_url = ((d.get("files") or [{}])[0]).get("upload_url")
+        if not upload_url:
+            raise RuntimeError(f"upload_to_disk без upload_url: {json.dumps(d, ensure_ascii=False)[:300]}")
+        try:
+            location = _put_bytes(upload_url, data, ctype, cookie)
+            break
+        except (OSError, http.client.HTTPException) as e:  # URLError - подкласс OSError
+            if attempt == UPLOAD_TRIES:
+                raise
+            host = urllib.parse.urlparse(upload_url).hostname
+            print(f"upload: попытка {attempt} на {host} не удалась ({type(e).__name__}: {e}), "
+                  f"повтор через {attempt * 3} с", file=sys.stderr)
+            time.sleep(attempt * 3)
 
     d = call("add_files", {"chat_id": chat_id, "files": [{"location": location}]},
              csrf=True, cookie=cookie)
