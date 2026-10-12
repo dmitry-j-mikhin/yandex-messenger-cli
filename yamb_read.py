@@ -11,7 +11,7 @@ yamb_config (~/.config/yandex-messenger/config.json), а не в коде — с
 
 Протокол снят реверсом веб-клиента (см. conarti/yandex-messenger-mcp) и HAR-записи.
 """
-import os, re, ssl, socket, json, base64, hashlib, struct, sqlite3, shutil, tempfile, sys
+import os, re, ssl, socket, json, base64, hashlib, struct, sqlite3, shutil, tempfile, sys, time
 
 import yamb_config
 
@@ -263,10 +263,46 @@ def connect_ws(cookie, uid=None):
     })
     return WS(WS_HOST, WS_PORT, f"{WS_PATH}?{q}", cookie)
 
+# Повторы чтения: сервер временами молчит (recv ждёт до таймаута сокета) или шлёт одни
+# пинги без ответа. Чтение безопасно повторять - каждая попытка на новом сокете.
+# Отправку (yamb_send) так не повторяем: push необратим.
+HISTORY_TRIES = 4             # попыток всего
+HISTORY_ATTEMPT_SEC = 25      # срок одной попытки, включая подключение
+HISTORY_BACKOFF_SEC = (2, 5, 10)
+
+def _history_once(cookie, params):
+    """Одна попытка: свой сокет, запрос history, ждём наш DATA-ответ не дольше срока."""
+    deadline = time.monotonic() + HISTORY_ATTEMPT_SEC
+    ws = connect_ws(cookie)
+    try:
+        seq = 1
+        ws.send(encode_data_frame(seq, "history", params), opcode=0x2)
+        # читаем кадры, пока не придёт наш DATA-ответ (elems[1] == seq)
+        while True:
+            if time.monotonic() > deadline:
+                raise TimeoutError(f"нет ответа на history за {HISTORY_ATTEMPT_SEC} с")
+            opcode, payload = ws.recv_frame()
+            if opcode == 0x8:  # close
+                raise ConnectionError(f"server closed: {payload[:200]!r}")
+            if opcode == 0x9:  # ping -> pong
+                ws.send(payload, opcode=0xA); continue
+            if opcode == 0x1:  # текстовый операционный кадр (ping/subscribed)
+                continue
+            if opcode == 0x2:  # binary DATA
+                try:
+                    ft, elems, pl = decode_data_frame(payload)
+                except Exception:
+                    continue
+                if ft == 0x01 and len(elems) >= 2 and elems[1] == seq:
+                    return pl
+    finally:
+        ws.close()
+
 def read_history(partner_or_chatid, limit=10, with_chat_data=False, max_timestamp=None):
     """
     Страница истории. with_chat_data просит `ChatDataFilter:{}` — только с ним у треда
     приезжает ThreadParentMessage. max_timestamp — курсор вглубь (строго старше метки).
+    Сбои связи (таймаут, обрыв, ошибка TLS) повторяются на новом сокете с паузами.
     """
     chat_id = resolve_chat_id(partner_or_chatid)
 
@@ -274,44 +310,23 @@ def read_history(partner_or_chatid, limit=10, with_chat_data=False, max_timestam
     if "Session_id" not in cookie:
         raise RuntimeError("нет Session_id в куках выбранного контейнера — сессия не залогинена")
 
-    ws = connect_ws(cookie)
-
-    seq = 1
     req_id = base64.b16encode(os.urandom(8)).decode().lower()
     params = {"RequestId": req_id, "Limit": limit, "ChatId": chat_id}
     if with_chat_data:
         params["ChatDataFilter"] = {}
     if max_timestamp is not None:
         params["MaxTimestamp"] = int(max_timestamp)
-    frame = encode_data_frame(seq, "history", params)
-    ws.send(frame, opcode=0x2)
 
-    # читаем кадры, пока не придёт наш DATA-ответ (elems[1] == seq)
-    result = None
-    for _ in range(200):
-        opcode, payload = ws.recv_frame()
-        if opcode == 0x8:  # close
-            raise ConnectionError(f"server closed: {payload[:200]!r}")
-        if opcode == 0x9:  # ping -> pong
-            ws.send(payload, opcode=0xA); continue
-        if opcode == 0x1:  # текстовый операционный кадр (ping/subscribed)
-            try:
-                op = json.loads(payload.decode())
-                if op.get("operation") == "ping":
-                    pass
-            except Exception:
-                pass
-            continue
-        if opcode == 0x2:  # binary DATA
-            try:
-                ft, elems, pl = decode_data_frame(payload)
-            except Exception:
-                continue
-            if ft == 0x01 and len(elems) >= 2 and elems[1] == seq:
-                result = pl
-                break
-    ws.close()
-    return chat_id, result
+    for attempt in range(1, HISTORY_TRIES + 1):
+        try:
+            return chat_id, _history_once(cookie, params)
+        except (OSError, ConnectionError, ssl.SSLError) as e:  # TimeoutError - подкласс OSError
+            if attempt == HISTORY_TRIES:
+                raise
+            pause = HISTORY_BACKOFF_SEC[min(attempt, len(HISTORY_BACKOFF_SEC)) - 1]
+            print(f"history: попытка {attempt} не удалась ({type(e).__name__}: {e}), "
+                  f"повтор через {pause} с", file=sys.stderr)
+            time.sleep(pause)
 
 def read_thread(parent_or_thread_id, parent_ts=None, limit=20):
     """
