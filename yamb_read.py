@@ -54,8 +54,8 @@ def load_cookies():
 
 # --- 2. минимальный WebSocket-клиент (RFC6455) ---
 class WS:
-    def __init__(self, host, port, path, cookie, origin="https://yandex.ru"):
-        raw = socket.create_connection((host, port), timeout=20)
+    def __init__(self, host, port, path, cookie, origin="https://yandex.ru", timeout=20):
+        raw = socket.create_connection((host, port), timeout=timeout)
         ctx = ssl.create_default_context()
         self.s = ctx.wrap_socket(raw, server_hostname=host)
         key = base64.b64encode(os.urandom(16)).decode()
@@ -247,7 +247,7 @@ def parse_thread_id(thread_id):
 def is_thread_id(value):
     return bool(_THREAD_ID_RE.match(value))
 
-def connect_ws(cookie, uid=None):
+def connect_ws(cookie, uid=None, timeout=20):
     """
     Открывает xiva-сокет. Порядок параметров запроса — как у веб-клиента.
     uid обязателен: без него сервер рвёт соединение сразу после handshake.
@@ -261,26 +261,31 @@ def connect_ws(cookie, uid=None):
         "client": "web_main",
         "user": uid or my_uid(),
     })
-    return WS(WS_HOST, WS_PORT, f"{WS_PATH}?{q}", cookie)
+    return WS(WS_HOST, WS_PORT, f"{WS_PATH}?{q}", cookie, timeout=timeout)
 
 # Повторы чтения: сервер временами молчит (recv ждёт до таймаута сокета) или шлёт одни
 # пинги без ответа. Чтение безопасно повторять - каждая попытка на новом сокете.
 # Отправку (yamb_send) так не повторяем: push необратим.
-HISTORY_TRIES = 4             # попыток всего
-HISTORY_ATTEMPT_SEC = 25      # срок одной попытки, включая подключение
-HISTORY_BACKOFF_SEC = (2, 5, 10)
+# Здоровое чтение - около секунды, а зависшее соединение не оживает: лучше
+# быстро бросить попытку и открыть новое (12.10: попытки по 25 с висели
+# все четыре, а новый процесс сразу после прочитал за 1 с).
+HISTORY_TRIES = 6             # попыток всего
+HISTORY_ATTEMPT_SEC = 10      # срок одной попытки, включая подключение
+HISTORY_BACKOFF_SEC = (1, 2, 4, 8)
 
 def _history_once(cookie, params):
     """Одна попытка: свой сокет, запрос history, ждём наш DATA-ответ не дольше срока."""
     deadline = time.monotonic() + HISTORY_ATTEMPT_SEC
-    ws = connect_ws(cookie)
+    ws = connect_ws(cookie, timeout=HISTORY_ATTEMPT_SEC)
     try:
         seq = 1
         ws.send(encode_data_frame(seq, "history", params), opcode=0x2)
         # читаем кадры, пока не придёт наш DATA-ответ (elems[1] == seq)
         while True:
-            if time.monotonic() > deadline:
+            left = deadline - time.monotonic()
+            if left <= 0:
                 raise TimeoutError(f"нет ответа на history за {HISTORY_ATTEMPT_SEC} с")
+            ws.s.settimeout(left)  # recv не дольше остатка срока
             opcode, payload = ws.recv_frame()
             if opcode == 0x8:  # close
                 raise ConnectionError(f"server closed: {payload[:200]!r}")
