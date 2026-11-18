@@ -443,13 +443,20 @@ def print_message(m, indent=""):
                 print(f"{indent}       {build_thread_id(parent_chat, ts)}")
             except ValueError:
                 pass
-    # ответ/пересылка: сервер разворачивает ForwardedMessageRefs в ForwardedMessages
-    for fwd in sm.get("ForwardedMessages") or []:
+    # ответ/пересылка: сервер разворачивает ForwardedMessageRefs в ForwardedMessages.
+    # Если отвечали на выделенный кусок, сам кусок лежит в Plain.ForwardedMessageStyles[i].Quote
+    # (тот же индекс, что у ForwardedMessages), а ForwardedMessages несёт сообщение целиком.
+    styles = ((sm.get("ClientMessage") or {}).get("Plain") or {}).get("ForwardedMessageStyles") or []
+    for i, fwd in enumerate(sm.get("ForwardedMessages") or []):
         info = fwd.get("ServerMessageInfo", {})
         src = (info.get("From") or {}).get("DisplayName") or "?"
         payload = fwd.get("Payload") or {}
         quoted = (payload.get("Text") or {}).get("MessageText")
-        print(f"{indent}    ↳ в ответ на [{fmt_ts(info.get('Timestamp'))}] {src}: {quoted!r}")
+        quote = (styles[i] if i < len(styles) else {}).get("Quote")
+        if quote and quote != quoted:
+            print(f"{indent}    ↳ в ответ на цитату из [{fmt_ts(info.get('Timestamp'))}] {src}: {quote!r}")
+        else:
+            print(f"{indent}    ↳ в ответ на [{fmt_ts(info.get('Timestamp'))}] {src}: {quoted!r}")
         # у пересланного тело лежит прямо в Payload, а не под ClientMessage.Plain
         for a in attachments({"ClientMessage": {"Plain": payload}}):
             print(f"{indent}        📎 {a['kind']}: {a.get('name') or '?'}  file_id={a['file_id']}")
